@@ -74,7 +74,32 @@ jobs:
           ls -lh $INSTALL_DIR/lib/libx264.a
           ls -lh $INSTALL_DIR/lib/pkgconfig/x264.pc
 
-      # ── 5. 下载 FFmpeg 源码 ───────────────────────────────────────────────────
+      # ── 5. 创建 pkg-config 交叉编译包装器 ────────────────────────────────────
+      #
+      # 根本原因：FFmpeg configure 脚本在交叉编译模式下调用系统 pkg-config，
+      # 而系统 pkg-config 不会自动读取我们为交叉编译设置的 PKG_CONFIG_PATH/LIBDIR。
+      # 解决方案：写一个包装脚本，强制设置好路径后再调用真正的 pkg-config，
+      # 然后通过 --pkg-config 参数传给 FFmpeg configure。
+      - name: Create pkg-config cross wrapper
+        run: |
+          PKG_WRAPPER="$GITHUB_WORKSPACE/aarch64-pkg-config"
+          PCDIR="$INSTALL_DIR/lib/pkgconfig"
+
+          # 用 printf 写脚本，避免 heredoc 与变量展开的冲突
+          printf '#!/usr/bin/env bash\n' > "$PKG_WRAPPER"
+          printf 'export PKG_CONFIG_PATH="%s"\n' "$PCDIR" >> "$PKG_WRAPPER"
+          printf 'export PKG_CONFIG_LIBDIR="%s"\n' "$PCDIR" >> "$PKG_WRAPPER"
+          printf 'export PKG_CONFIG_SYSROOT_DIR=""\n' >> "$PKG_WRAPPER"
+          printf 'exec pkg-config "$@"\n' >> "$PKG_WRAPPER"
+          chmod +x "$PKG_WRAPPER"
+          echo "PKG_WRAPPER=$PKG_WRAPPER" >> $GITHUB_ENV
+
+          echo "--- pkg-config wrapper content ---"
+          cat "$PKG_WRAPPER"
+          echo "--- verify x264.pc ---"
+          "$PKG_WRAPPER" --modversion x264 && echo "x264 found OK" || echo "WARNING: x264 not found (expected before x264 build step)"
+
+      # ── 6. 下载 FFmpeg 源码 ───────────────────────────────────────────────────
       - name: Download FFmpeg source
         run: |
           FFMPEG_VERSION="7.1.1"
@@ -85,15 +110,11 @@ jobs:
           tar -xf ffmpeg.tar.xz
           echo "FFMPEG_SRC=ffmpeg-${FFMPEG_VERSION}" >> $GITHUB_ENV
 
-      # ── 6. Configure FFmpeg（含 x264）────────────────────────────────────────
+      # ── 7. Configure FFmpeg（含 x264）────────────────────────────────────────
       - name: Configure FFmpeg
         run: |
           mkdir -p "$INSTALL_DIR"
           cd ${{ env.FFMPEG_SRC }}
-
-          # 让 pkg-config 找到交叉编译的 x264.pc
-          export PKG_CONFIG_PATH="$INSTALL_DIR/lib/pkgconfig"
-          export PKG_CONFIG_LIBDIR="$INSTALL_DIR/lib/pkgconfig"
 
           ./configure \
             --prefix="$INSTALL_DIR" \
@@ -126,15 +147,16 @@ jobs:
             --extra-cflags="-march=armv8-a -O2 -I${INSTALL_DIR}/include" \
             --extra-ldflags="-L${INSTALL_DIR}/lib" \
             --extra-libs="-lpthread -lm" \
+            --pkg-config="${PKG_WRAPPER}" \
             --pkg-config-flags="--static"
 
-      # ── 7. 编译 FFmpeg ────────────────────────────────────────────────────────
+      # ── 8. 编译 FFmpeg ────────────────────────────────────────────────────────
       - name: Build FFmpeg
         run: |
           cd ${{ env.FFMPEG_SRC }}
           make -j$(nproc)
 
-      # ── 8. 安装到 output 目录 ─────────────────────────────────────────────────
+      # ── 9. 安装到 output 目录 ─────────────────────────────────────────────────
       - name: Install FFmpeg
         run: |
           cd ${{ env.FFMPEG_SRC }}
@@ -148,18 +170,17 @@ jobs:
             $INSTALL_DIR/lib/libavcodec.so.* 2>/dev/null \
             | grep -i "NEEDED\|x264" || true
 
-      # ── 9. 打包产物（lib + include + bin）────────────────────────────────────
+      # ── 10. 打包产物（lib + include + bin）───────────────────────────────────
       - name: Package output
         run: |
           cd $GITHUB_WORKSPACE
-          # 只打包 lib 和 include，不含 x264 静态库（静态库已静态链进 .so）
           tar -czf ffmpeg-aarch64-x264-linaro750.tar.gz \
             output/lib \
             output/include \
             output/bin
           echo "Package size: $(du -sh ffmpeg-aarch64-x264-linaro750.tar.gz | cut -f1)"
 
-      # ── 10. 上传 artifact ─────────────────────────────────────────────────────
+      # ── 11. 上传 artifact ─────────────────────────────────────────────────────
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
