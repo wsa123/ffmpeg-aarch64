@@ -1,0 +1,168 @@
+name: Build FFmpeg aarch64 with x264 (Linaro 7.5.0)
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:   # 允许手动在 GitHub 网页上点击触发
+
+jobs:
+  build:
+    name: Cross-compile FFmpeg + x264 for AArch64
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+
+    env:
+      CROSS_PREFIX: aarch64-linux-gnu-
+      TOOLCHAIN_DIR: /home/runner/toolchain
+      SYSROOT_DIR: /home/runner/toolchain/aarch64-linux-gnu/libc
+      INSTALL_DIR: ${{ github.workspace }}/output
+      X264_VERSION: "0.164.3198"      # stable snapshot tag (master~3198)
+
+    steps:
+      # ── 1. 检出仓库 ──────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. 安装宿主机依赖 ─────────────────────────────────────────────────────
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            wget tar xz-utils \
+            make yasm nasm \
+            pkg-config \
+            git ca-certificates \
+            autoconf automake libtool
+
+      # ── 3. 下载 Linaro 7.5.0 工具链 ──────────────────────────────────────────
+      - name: Download Linaro toolchain
+        run: |
+          TOOLCHAIN_URL="https://releases.linaro.org/components/toolchain/binaries/latest-7/aarch64-linux-gnu/gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu.tar.xz"
+          echo "Downloading Linaro toolchain..."
+          wget -q --show-progress "$TOOLCHAIN_URL" -O toolchain.tar.xz
+          mkdir -p $TOOLCHAIN_DIR
+          tar -xf toolchain.tar.xz -C $TOOLCHAIN_DIR --strip-components=1
+          echo "$TOOLCHAIN_DIR/bin" >> $GITHUB_PATH
+          echo "Toolchain version:"
+          $TOOLCHAIN_DIR/bin/aarch64-linux-gnu-gcc --version
+
+      # ── 4. 交叉编译 x264（生成静态库供 FFmpeg 链接）───────────────────────────
+      - name: Build x264 (cross-compile for aarch64)
+        run: |
+          echo "Cloning x264 stable branch..."
+          git clone --depth=1 https://code.videolan.org/videolan/x264.git x264-src
+
+          cd x264-src
+
+          # x264 的 configure 没有 --enable-cross-compile，直接通过 CC/HOST 指定
+          ./configure \
+            --prefix="$INSTALL_DIR" \
+            --host=aarch64-linux-gnu \
+            --cross-prefix=${CROSS_PREFIX} \
+            --sysroot="$SYSROOT_DIR" \
+            --enable-static \
+            --disable-shared \
+            --disable-opencl \
+            --disable-cli \
+            --enable-pic
+
+          make -j$(nproc)
+          make install
+
+          echo ""
+          echo "===== x264 安装产物 ====="
+          ls -lh $INSTALL_DIR/lib/libx264.a
+          ls -lh $INSTALL_DIR/lib/pkgconfig/x264.pc
+
+      # ── 5. 下载 FFmpeg 源码 ───────────────────────────────────────────────────
+      - name: Download FFmpeg source
+        run: |
+          FFMPEG_VERSION="7.1.1"
+          echo "Downloading FFmpeg ${FFMPEG_VERSION}..."
+          wget -q --show-progress \
+            "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz" \
+            -O ffmpeg.tar.xz
+          tar -xf ffmpeg.tar.xz
+          echo "FFMPEG_SRC=ffmpeg-${FFMPEG_VERSION}" >> $GITHUB_ENV
+
+      # ── 6. Configure FFmpeg（含 x264）────────────────────────────────────────
+      - name: Configure FFmpeg
+        run: |
+          mkdir -p "$INSTALL_DIR"
+          cd ${{ env.FFMPEG_SRC }}
+
+          # 让 pkg-config 找到交叉编译的 x264.pc
+          export PKG_CONFIG_PATH="$INSTALL_DIR/lib/pkgconfig"
+          export PKG_CONFIG_LIBDIR="$INSTALL_DIR/lib/pkgconfig"
+
+          ./configure \
+            --prefix="$INSTALL_DIR" \
+            --enable-cross-compile \
+            --cross-prefix=${CROSS_PREFIX} \
+            --arch=aarch64 \
+            --target-os=linux \
+            --sysroot="$SYSROOT_DIR" \
+            --enable-shared \
+            --disable-static \
+            --disable-doc \
+            --disable-htmlpages \
+            --disable-manpages \
+            --disable-podpages \
+            --disable-txtpages \
+            --disable-ffplay \
+            --disable-debug \
+            --enable-optimizations \
+            --enable-gpl \
+            --enable-version3 \
+            --enable-nonfree \
+            --disable-network \
+            --enable-avcodec \
+            --enable-avformat \
+            --enable-avutil \
+            --enable-swscale \
+            --enable-swresample \
+            --enable-avfilter \
+            --enable-libx264 \
+            --extra-cflags="-march=armv8-a -O2 -I${INSTALL_DIR}/include" \
+            --extra-ldflags="-L${INSTALL_DIR}/lib" \
+            --extra-libs="-lpthread -lm" \
+            --pkg-config-flags="--static"
+
+      # ── 7. 编译 FFmpeg ────────────────────────────────────────────────────────
+      - name: Build FFmpeg
+        run: |
+          cd ${{ env.FFMPEG_SRC }}
+          make -j$(nproc)
+
+      # ── 8. 安装到 output 目录 ─────────────────────────────────────────────────
+      - name: Install FFmpeg
+        run: |
+          cd ${{ env.FFMPEG_SRC }}
+          make install
+          echo ""
+          echo "===== 动态库产物列表 ====="
+          find $INSTALL_DIR/lib -name "*.so*" | sort
+          echo ""
+          echo "===== 验证 x264 是否已链接 ====="
+          $TOOLCHAIN_DIR/bin/aarch64-linux-gnu-objdump -p \
+            $INSTALL_DIR/lib/libavcodec.so.* 2>/dev/null \
+            | grep -i "NEEDED\|x264" || true
+
+      # ── 9. 打包产物（lib + include + bin）────────────────────────────────────
+      - name: Package output
+        run: |
+          cd $GITHUB_WORKSPACE
+          # 只打包 lib 和 include，不含 x264 静态库（静态库已静态链进 .so）
+          tar -czf ffmpeg-aarch64-x264-linaro750.tar.gz \
+            output/lib \
+            output/include \
+            output/bin
+          echo "Package size: $(du -sh ffmpeg-aarch64-x264-linaro750.tar.gz | cut -f1)"
+
+      # ── 10. 上传 artifact ─────────────────────────────────────────────────────
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-aarch64-x264-linaro750
+          path: ffmpeg-aarch64-x264-linaro750.tar.gz
+          retention-days: 30
