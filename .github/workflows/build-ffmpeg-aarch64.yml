@@ -102,7 +102,7 @@ jobs:
       # ── 6. 下载 FFmpeg 源码 ───────────────────────────────────────────────────
       - name: Download FFmpeg source
         run: |
-          FFMPEG_VERSION="7.1.1"
+          FFMPEG_VERSION="7.0.2"
           echo "Downloading FFmpeg ${FFMPEG_VERSION}..."
           wget -q --show-progress \
             "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz" \
