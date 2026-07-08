@@ -99,6 +99,7 @@ output/
 ```
 --enable-libx264
 --enable-libopus
+ffmpeg-aarch64-x264-linaro750.zip编译的是7.1.1的版本
 --enable-libvorbis
 ```
 
